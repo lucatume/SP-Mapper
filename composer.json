@@ -1,0 +1,18 @@
+{
+  "name": "lucatume/sp-mapper",
+  "autoload": {
+    "psr-4": {
+      "Lucatume\\SpMapper\\": "src/"
+    }
+  },
+  "authors": [
+    {
+      "name": "Luca Tumedei",
+      "email": "luca@theaveragedev.com"
+    }
+  ],
+  "require": {
+    "nikic/php-parser": "^4.15",
+    "ext-readline": "*"
+  }
+}

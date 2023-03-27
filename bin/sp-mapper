@@ -1,0 +1,145 @@
+#! /usr/bin/env php
+<?php
+
+use Lucatume\SpMapper\Extending_Finder;
+use Lucatume\SpMapper\Method_Finder;
+use PhpParser\ParserFactory;
+
+// Parse for the -q option using getopt.
+$opts  = getopt( 'q', [ 'quiet' ], $optind );
+$quiet = isset( $opts['q'] );
+
+// Get path and output file from the rest of the arguments.
+if ( ! isset( $argv[ $optind ] ) ) {
+	echo "Usage: $argv[0] <path_to_src> [<output_file>]" . PHP_EOL;
+	exit( 1 );
+}
+
+$path            = $argv[ $optind ];
+$csv_output_file = $argv[ $optind + 1 ] ?? ( getcwd() . '/sp-mapper.csv' );
+
+if ( ! ( is_file( $path ) || is_dir( $path ) ) ) {
+	throw new InvalidArgumentException( 'File ' . $path . ' does not exist.' );
+}
+
+if ( is_dir( $path ) ) {
+	$iterator_flags = FilesystemIterator::SKIP_DOTS
+	                  | FilesystemIterator::FOLLOW_SYMLINKS
+	                  | FilesystemIterator::CURRENT_AS_PATHNAME
+	                  | FilesystemIterator::UNIX_PATHS;
+	$files          = new CallbackFilterIterator( new RecursiveIteratorIterator(
+		new RecursiveDirectoryIterator( $path, $iterator_flags ),
+		RecursiveIteratorIterator::LEAVES_ONLY
+	), static fn( string $file ) => str_ends_with( $file, '.php' ) );
+} else {
+	$files = [ $path ];
+}
+
+require_once __DIR__ . '/../vendor/autoload.php';
+
+$parser       = ( new ParserFactory )->create( ParserFactory::PREFER_PHP7 );
+$nameResolver = new PhpParser\NodeVisitor\NameResolver;
+
+// Run a first pass and find all the classes directly extending the Service Provider.
+$nodeTraverser = new PhpParser\NodeTraverser;
+$nodeTraverser->addVisitor( $nameResolver );
+$sp_classes   = [
+	'tad_DI52_ServiceProvider',
+	'tad_DI52_Container',
+	'TEC\\Common\\lucatume\\DI52\\ServiceProvider',
+];
+$sp_visitor_1 = new Extending_Finder( $sp_classes );
+$nodeTraverser->addVisitor( $sp_visitor_1 );
+
+foreach ( $files as $file ) {
+	$stmts = $parser->parse( file_get_contents( $file ) );
+	$sp_visitor_1->set_file( $file );
+	$nodeTraverser->traverse( $stmts );
+	echo '.';
+}
+
+echo PHP_EOL;
+echo 'Found ' . count( $sp_visitor_1->get_found() ) . ' Service Providers directly extending the base classes.' . PHP_EOL;
+
+// Run a second pass and find all the classes extending the found Service Providers and the original ones.
+$nodeTraverser = new PhpParser\NodeTraverser;
+$nodeTraverser->addVisitor( $nameResolver );
+$sp_visitor_2 = new Extending_Finder( array_merge( $sp_visitor_1->get_found(), $sp_classes ) );
+$nodeTraverser->addVisitor( $sp_visitor_2 );
+
+foreach ( $files as $file ) {
+	$stmts = $parser->parse( file_get_contents( $file ) );
+	$sp_visitor_2->set_file( $file );
+	$nodeTraverser->traverse( $stmts );
+	echo '.';
+}
+
+echo PHP_EOL;
+
+if ( ! count( $sp_visitor_2->get_found() ) ) {
+	echo 'No Service Providers found.' . PHP_EOL;
+	exit( 0 );
+}
+
+echo 'Found ' . count( $sp_visitor_2->get_found() ) . ' Service Providers.' . PHP_EOL;
+$appending = file_exists( $csv_output_file );
+if ( ! $quiet && $appending ) {
+	// Ask the user if it should append to it.
+	$answer = readline( 'File ' . $csv_output_file . ' already exists, append to it? [y/N] ' );
+	if ( ! in_array( strtolower( $answer ), [ 'y', 'yes' ], true ) ) {
+		echo 'Ok, bye.' . PHP_EOL;
+		exit( 0 );
+	}
+	echo 'Appending to ' . $csv_output_file . PHP_EOL;
+}
+
+// Implicitly append to the same file.
+$output_file = fopen( $csv_output_file, 'ab' );
+if ( ! $output_file ) {
+	throw new RuntimeException( 'Could not open file ' . $csv_output_file . ' for writing.' );
+}
+
+if ( ! $appending && ! fputcsv( $output_file, [
+		'file',
+		'class',
+		'has_unregister',
+		'public_methods_count',
+		'private_methods_count',
+		'LOC',
+		'average method LOC',
+		'longest method LOC',
+	] ) ) {
+	throw new RuntimeException( 'Could not write to file ' . $output_file . '.' );
+}
+
+// For each file found in the second pass collect some information.
+foreach ( $sp_visitor_2->get_found() as $file => $class ) {
+	$public_methods  = [];
+	$private_methods = [];
+	$file_loc        = count( file( $file ) );
+
+	$nodeTraverser = new PhpParser\NodeTraverser;
+	$visitor       = new Method_Finder( $file );
+	$nodeTraverser->addVisitor( $visitor );
+	$stmts = $parser->parse( file_get_contents( $file ) );
+	$nodeTraverser->traverse( $stmts );
+	$public_methods = $visitor->get_public_methods();
+
+	// If it extends the base Service Provider class, it will have the register method: skip it.
+	if ( ! fputcsv( $output_file, [
+		$file,
+		$class,
+		isset( $public_methods['unregister'] ) ? 1 : 0,
+		count( $public_methods ),
+		count( $visitor->get_private_methods() ),
+		$file_loc,
+		$visitor->get_avg_method_loc(),
+		$visitor->get_max_method_loc(),
+	] ) ) {
+		throw new RuntimeException( 'Could not write to file ' . $output_file . '.' );
+	}
+}
+
+fclose( $output_file );
+
+echo "Output saved to " . $csv_output_file . '.' . PHP_EOL;
